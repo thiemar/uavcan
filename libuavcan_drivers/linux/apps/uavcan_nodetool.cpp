@@ -11,6 +11,7 @@
 #include <iterator>
 #include <uavcan_linux/uavcan_linux.hpp>
 #include <uavcan/protocol/node_status_monitor.hpp>
+#include <uavcan/protocol/dynamic_node_id_allocation_server.hpp>
 #include "debug.hpp"
 
 #include <uavcan/protocol/param/GetSet.hpp>
@@ -136,6 +137,130 @@ void printGetSetResponse(const uavcan::protocol::param::GetSet::Response& resp)
     std::cout.width(0);         // Clears the effect of std::setw()
     std::cout.flags(original_flags);
 }
+
+class StorageBackend : public uavcan::IDynamicNodeIDStorageBackend
+{
+    typedef std::map<String, String> Container;
+    Container container_;
+
+    bool fail_;
+
+public:
+    StorageBackend()
+        : fail_(false)
+    { }
+
+    virtual String get(const String& key) const
+    {
+        const Container::const_iterator it = container_.find(key);
+        if (it == container_.end())
+        {
+            return String();
+        }
+        return it->second;
+    }
+
+    virtual void set(const String& key, const String& value)
+    {
+        if (!fail_)
+        {
+            container_[key] = value;
+        }
+    }
+
+    void failOnSetCalls(bool really) { fail_ = really; }
+
+    void reset() { container_.clear(); }
+
+    unsigned getNumKeys() const { return unsigned(container_.size()); }
+
+    void print() const
+    {
+        for (Container::const_iterator it = container_.begin(); it != container_.end(); ++it)
+        {
+            std::cout << it->first.c_str() << "\t" << it->second.c_str() << std::endl;
+        }
+    }
+};
+
+
+class EventTracer : public uavcan::IDynamicNodeIDAllocationServerEventTracer
+{
+    const std::string id_;
+
+    virtual void onEvent(uavcan::uint16_t code, uavcan::int64_t argument)
+    {
+        std::cout << "EVENT [" << id_ << "]\t" << code << "\t" << getEventName(code) << "\t" << argument << std::endl;
+    }
+
+public:
+    EventTracer() { }
+
+    EventTracer(const std::string& id) : id_(id) { }
+};
+
+
+class CommitHandler : public uavcan::dynamic_node_id_server_impl::ILeaderLogCommitHandler
+{
+    const std::string id_;
+
+    virtual void onEntryCommitted(const uavcan::protocol::dynamic_node_id::server::Entry& entry)
+    {
+        std::cout << "ENTRY COMMITTED [" << id_ << "]\n" << entry << std::endl;
+    }
+
+    virtual void onLeaderChange(bool local_node_is_leader)
+    {
+        std::cout << "I AM LEADER: " << (local_node_is_leader ? "YES" : "NOT ANYMORE") << std::endl;
+    }
+
+public:
+    CommitHandler(const std::string& id) : id_(id) { }
+};
+
+
+class AllocationRequestHandler : public uavcan::dynamic_node_id_server_impl::IAllocationRequestHandler
+{
+    std::vector<std::pair<UniqueID, uavcan::NodeID> > requests_;
+
+public:
+    virtual void handleAllocationRequest(const UniqueID& unique_id, uavcan::NodeID preferred_node_id)
+    {
+        requests_.push_back(std::pair<UniqueID, uavcan::NodeID>(unique_id, preferred_node_id));
+    }
+
+    bool matchAndPopLastRequest(const UniqueID& unique_id, uavcan::NodeID preferred_node_id)
+    {
+        if (requests_.empty())
+        {
+            std::cout << "No pending requests" << std::endl;
+            return false;
+        }
+
+        const std::pair<UniqueID, uavcan::NodeID> pair = requests_.at(requests_.size() - 1U);
+        requests_.pop_back();
+
+        if (pair.first != unique_id)
+        {
+            std::cout << "Unique ID mismatch" << std::endl;
+            return false;
+        }
+
+        if (pair.second != preferred_node_id)
+        {
+            std::cout << "Node ID mismatch (" << pair.second.get() << ", " << preferred_node_id.get() << ")"
+                << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    void reset() { requests_.clear(); }
+};
+
+
+static const unsigned NumEntriesInStorageWithEmptyLog = 4;  // last index + 3 items per log entry
 
 uavcan_linux::NodePtr initNode(const std::vector<std::string>& ifaces, uavcan::NodeID nid, const std::string& name)
 {
@@ -383,6 +508,12 @@ int main(int argc, const char** argv)
         const int self_node_id = std::stoi(argv[1]);
         const std::vector<std::string> iface_names(argv + 2, argv + argc);
         uavcan_linux::NodePtr node = initNode(iface_names, self_node_id, "org.uavcan.linux_app.nodetool");
+
+        EventTracer tracer;
+        StorageBackend storage;
+        uavcan::DynamicNodeIDAllocationServer server(*node, storage, tracer);
+        server.init(1);
+
         runForever(node);
         return 0;
     }
